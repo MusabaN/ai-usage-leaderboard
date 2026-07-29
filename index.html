@@ -448,6 +448,7 @@
         <div class="modal-header">
           <h2 id="modalUserName">User Details</h2>
           <p id="modalTokenCount" style="margin-top: 8px; color: var(--accent); font-weight: 600;"></p>
+          <p id="modalPricingNote" class="hidden" style="margin-top: 6px; color: var(--muted);"></p>
         </div>
         
         <div class="chart-container">
@@ -491,10 +492,12 @@
       const modalOverlay = document.getElementById("modalOverlay");
       const closeModal = document.getElementById("closeModal");
       const modalUserName = document.getElementById("modalUserName");
+      const modalPricingNote = document.getElementById("modalPricingNote");
       const searchContainer = document.getElementById("searchContainer");
       const userSearch = document.getElementById("userSearch");
 
       const MODEL_PRICING_URL = "https://raw.githubusercontent.com/github/docs/main/data/tables/copilot/models-and-pricing.yml";
+      const UNKNOWN_MODEL_PRICE_PER_MILLION = 5.00;
       const FALLBACK_MODEL_PRICING = [
         { model: "GPT-5 mini", input: 0.25, output: 2.00 },
         { model: "GPT-5.3-Codex", input: 1.75, output: 14.00 },
@@ -752,9 +755,12 @@
         const modelField = "model";
 
         function estimateTokens(model, cost) {
-          const pricePerMillion = modelPricing.get(canonicalModelName(model));
-          if (!pricePerMillion) return null;
-          return (cost / pricePerMillion) * 1000000;
+          const publicPrice = modelPricing.get(canonicalModelName(model));
+          const pricePerMillion = publicPrice ?? UNKNOWN_MODEL_PRICE_PER_MILLION;
+          return {
+            tokens: (cost / pricePerMillion) * 1000000,
+            usesFallbackPricing: publicPrice === undefined,
+          };
         }
 
         if (!rows[0] || !rows[0][usernameField]) {
@@ -824,7 +830,7 @@
               rawUsage: 0,
               rawGross: 0,
               estTokens: 0,
-              tokenEstimateAvailable: true,
+              usesFallbackPricing: false,
             };
             modStats.credits += credits;
             modStats.gross += Number.isNaN(gross) ? 0 : gross;
@@ -836,11 +842,8 @@
             
             modStats.rawUsage += Number.isNaN(rUsage) ? 0 : rUsage;
             modStats.rawGross += validGross;
-            if (estimatedTokens === null) {
-              modStats.tokenEstimateAvailable = false;
-            } else {
-              modStats.estTokens += estimatedTokens;
-            }
+            modStats.estTokens += estimatedTokens.tokens;
+            modStats.usesFallbackPricing ||= estimatedTokens.usesFallbackPricing;
             
             current.models.set(model, modStats);
           }
@@ -934,16 +937,18 @@
         const user = userDetailData.get(username);
         if (!user) return;
 
-        const modelStats = Array.from(user.models.values());
-        const totalTokens = modelStats.reduce((sum, model) => sum + model.estTokens, 0);
-        const unavailableModelCount = modelStats.filter(model => !model.tokenEstimateAvailable).length;
+        const modelEntries = Array.from(user.models.entries()).sort((a, b) => b[1].credits - a[1].credits);
+        const totalTokens = modelEntries.reduce((sum, [, model]) => sum + model.estTokens, 0);
+        const fallbackModels = modelEntries
+          .filter(([, model]) => model.usesFallbackPricing)
+          .map(([model]) => model);
         modalUserName.textContent = username;
-        const estimateNote = unavailableModelCount > 0
-          ? ` (excludes ${unavailableModelCount} model${unavailableModelCount === 1 ? "" : "s"} without public pricing)`
+        document.getElementById("modalTokenCount").textContent =
+          `Estimated Total Tokens: ${numberFormatter.format(Math.round(totalTokens))}`;
+        modalPricingNote.textContent = fallbackModels.length > 0
+          ? `${currencyFormatter.format(UNKNOWN_MODEL_PRICE_PER_MILLION)}/M fallback pricing used for: ${fallbackModels.join(", ")}`
           : "";
-        document.getElementById("modalTokenCount").textContent = totalTokens > 0
-          ? `Estimated Total Tokens: ${numberFormatter.format(Math.round(totalTokens))}${estimateNote}`
-          : `Estimated Total Tokens: unavailable${estimateNote}`;
+        modalPricingNote.classList.toggle("hidden", fallbackModels.length === 0);
         modalOverlay.classList.add("show");
 
         // Prepare Daily Cost Chart
@@ -963,13 +968,12 @@
         });
 
         // Prepare Model Usage Chart
-        const modelEntries = Array.from(user.models.entries()).sort((a, b) => b[1].credits - a[1].credits);
         const modelLabels = modelEntries.map(e => e[0]);
-        const modelUsageData = modelEntries.map(e => e[1].tokenEstimateAvailable ? e[1].estTokens : null);
+        const modelUsageData = modelEntries.map(e => e[1].estTokens);
         const modelCostData = modelEntries.map(e => e[1].rawGross);
         const modelEfficiencyData = modelEntries.map(e => {
           const cost = e[1].rawGross;
-          return e[1].tokenEstimateAvailable && cost > 0 ? e[1].estTokens / cost : null;
+          return cost > 0 ? e[1].estTokens / cost : 0;
         });
 
         renderChart("modelUsageChart", "bar", {
@@ -1005,9 +1009,12 @@
           plugins: {
             tooltip: {
               callbacks: {
-                label: (context) => context.raw === null
-                  ? "Pricing unavailable"
-                  : `${numberFormatter.format(Math.round(context.raw))} tokens per $1`
+                label: (context) => {
+                  const fallbackNote = modelEntries[context.dataIndex][1].usesFallbackPricing
+                    ? " (fallback pricing)"
+                    : "";
+                  return `${numberFormatter.format(Math.round(context.raw))} tokens per $1${fallbackNote}`;
+                }
               }
             }
           }
